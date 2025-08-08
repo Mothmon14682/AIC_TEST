@@ -9,14 +9,8 @@ from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 from numpy.linalg import norm
 
-# Load CLIP
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
 
-
-def extract_feature(model, processor):
+def extract_feature(model, processor, device):
     frame_dir = "frames"
     frame_files = sorted([f for f in os.listdir(frame_dir) if f.endswith(".jpg")])
     batch_size = 16
@@ -48,7 +42,7 @@ def extract_feature(model, processor):
     return features
 
 
-def extract_text_vector(text, processor):
+def extract_text_vector(text, model, processor, device):
     text_inputs = processor(text=[text], return_tensors="pt").to(device)
     with torch.no_grad():
         text_features = model.get_text_features(**text_inputs)
@@ -72,20 +66,22 @@ def cosine_similarity(a, b):
 def create_faiss_index(features):
     features_matrix = np.array(list(features.values())).astype("float32")
     faiss.normalize_L2(features_matrix)
-    index = faiss.IndexFlatL2(features_matrix.shape[1])
+    index = faiss.IndexFlatIP(features_matrix.shape[1])
     index.add(features_matrix)
     return index
 
 
 def similarity_text_with_video(features, text_vector, index, k=10):
     text_vector = text_vector / np.linalg.norm(text_vector)
-    query = np.expand_dims(text_vector.flatten(), axis=0)
+    query = text_vector.astype("float32")
+
     D, I = index.search(query, k)
 
     similarities = []
+    feature_keys = list(features.keys())
     for i, idx in enumerate(I[0]):
-        frame_name = list(features.keys())[idx]
-        score = 1 - 0.5 * D[0][i]  # L2 to cosine approximation
+        frame_name = feature_keys[idx]
+        score = D[0][i]
         similarities.append((frame_name, score))
     return similarities
 
@@ -123,8 +119,9 @@ def extract_video_and_frame(fname):
     match = re.match(r"(.+?)_(\d+)\.jpg", fname)
     return (match.group(1), int(match.group(2))) if match else (None, -1)
 
-def compute_combined_score(clip_score, inliers, max_clip, min_clip, max_inliers, alpha=0.6, beta=0.4):
-    norm_clip = (clip_score - min_clip) / (max_clip - min_clip + 1e-6)
+def compute_combined_score(clip_score, inliers, clip_mean, clip_std, max_inliers, alpha=0.6, beta=0.4):
+    norm_clip = (clip_score - clip_mean) / (clip_std + 1e-6)
+    norm_clip = max(min(norm_clip, 3), -3)
     norm_inlier = inliers / (max_inliers + 1e-6)
     return alpha * norm_clip + beta * norm_inlier
 
@@ -161,15 +158,13 @@ def rerank_with_nosac(
         max_inliers = max(max_inliers, inlier_count)
         scores_raw.append((fname, clip_score, inlier_count))
 
-    clip_scores = [score for _, score, _ in scores_raw]
-    min_clip = min(clip_scores)
-    max_clip = max(clip_scores)
+    clip_scores = np.array([score for _, score, _ in scores_raw])
+    clip_mean = clip_scores.mean()
+    clip_std = clip_scores.std()
 
     reranked = []
     for fname, clip_score, inlier_count in scores_raw:
-        final_score = compute_combined_score(
-            clip_score, inlier_count, max_clip, min_clip, max_inliers, alpha, beta
-        )
+        final_score = compute_combined_score(clip_score, inlier_count, clip_mean, clip_std, max_inliers, alpha, beta)
         reranked.append((fname, final_score, inlier_count))
 
     reranked.sort(key=lambda x: x[1], reverse=True)
@@ -218,6 +213,7 @@ def show_reranked_frames(reranked, frame_dir="frames", top_n=5):
     plt.tight_layout()
     plt.savefig("reranked_results.png")
     print("Saved as reranked_results.png")
+    plt.close()
 
 
 def show_unranked_frames(unranked, frame_dir="frames", top_n=5):
@@ -237,3 +233,4 @@ def show_unranked_frames(unranked, frame_dir="frames", top_n=5):
     
     plt.tight_layout()
     plt.savefig("bull_results.png")
+    plt.close()
