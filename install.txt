@@ -1,1 +1,1 @@
-pip install torch torchvision transformers pillow
+pip install torch torchvision transformers pillow faiss-cpu joblib mathplotlib
